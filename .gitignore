@@ -1,0 +1,7 @@
+node_modules/
+.env
+*.tsbuildinfo
+dist/
+*.pkcs8
+*.pem
+*.key
