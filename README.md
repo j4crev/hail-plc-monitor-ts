@@ -10,7 +10,8 @@ under `../hailproto/spec/account-onboarding.md`.
 This project is intentionally a sibling of `hailproto`, `hail-server-ts`, and
 the pinned official `did-method-plc` checkout. It cannot monitor the live POC
 DIDs via the public PLC registry because those DIDs exist only in its private
-directory. The private-directory URL may be used only in isolated tests.
+directory. The private-directory URL is used in isolated tests and the
+explicitly non-independent [same-VPS POC deployment](deploy/poc/README.md).
 
 ## Implemented Boundary
 
@@ -86,9 +87,11 @@ the public monitor key, never provider or user identity private keys.
 sequence zero and requires contiguous results. A large public directory
 requires a **verified bootstrap checkpoint** or complete backfill before it
 can assert coverage; an arbitrary late cursor is not proof of monitoring.
-The POC has not selected independently operated PLC mirrors, deployed this
-project on a separate user-owned host, or proven webhook delivery outside its
-test fixtures. Review and operation approval are local commands rather than a
+The POC has not selected independently operated PLC mirrors or deployed this
+project on a separate user-owned host. The same-VPS private-directory
+deployment has proven signed HTTPS webhook delivery and durable restart
+behavior with a disposable DID; it does not prove host independence.
+Review and operation approval are local commands rather than a
 cross-device user interface. A service hosted by the Hail provider may help
 users bootstrap but cannot satisfy the portable-custody rule that the monitor
 be outside the provider's administrative control.

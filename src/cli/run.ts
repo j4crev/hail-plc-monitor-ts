@@ -12,7 +12,8 @@ await database.migrate();
 const signer = await MonitorSigner.fromPrivateFile(Bun.env.MONITOR_PRIVATE_KEY_FILE);
 const monitor = new PlcMonitor(database.sql, new BoundedMonitorPlcClient(Bun.env.PLC_DIRECTORY_URL));
 const notifier = new MonitorNotifier(database.sql, signer, new PinnedHttpsAlertTransport());
-console.info(JSON.stringify({ event: "monitor-started", monitorDidKey: signer.publicDidKey }));
+console.info(JSON.stringify({ event: "monitor-started", monitorDidKey: signer.publicDidKey,
+  deploymentProfile: Bun.env.MONITOR_DEPLOYMENT_PROFILE ?? "unspecified" }));
 
 let polling = false;
 let notifying = false;

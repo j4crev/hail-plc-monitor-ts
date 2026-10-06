@@ -1,6 +1,8 @@
 node_modules/
 .opencode/
 .env
+secrets/
+*.sqlite*
 *.tsbuildinfo
 dist/
 *.pkcs8
