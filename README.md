@@ -3,7 +3,10 @@
 Prototype of a user-run monitor for the Hail portable-custody profile. The
 monitor validates DID operation logs, durably tracks the PLC export sequence,
 records unexpected operations and lost coverage, and signs bounded coverage
-attestations for a provider migration. Hosting it on infrastructure controlled
+attestations for a provider migration. Migration 3 adds reviewed bootstrap
+checkpoint retention and durable backfill readiness; see the candidate
+[PLC read-evidence policy](https://github.com/j4crev/hailproto/blob/main/spec/plc-read-evidence.md).
+Hosting it on infrastructure controlled
 by a Hail provider is a **bootstrap convenience**, not independent coverage
 under `../hailproto/spec/account-onboarding.md`.
 
@@ -21,7 +24,10 @@ DIDs, it validates the complete PLC operation log, resulting state, current
 CID and non-nullified audit entry. Every unexpected operation creates a
 durable alert without silently changing the user's expected state. A poll
 after more than 24 hours without coverage records a separate lost-coverage
-alert. Alerts are queued before a DNS-pinned, certificate-validating HTTPS
+alert, including enrollment that never completed its first healthy backfill.
+A full export page reports `backfilling`, not healthy coverage; failed/gapped
+polls clear readiness. Only a short/empty contiguous page establishes catch-up.
+Alerts are queued before a DNS-pinned, certificate-validating HTTPS
 webhook attempt, and retry durably until a `2xx` response. The webhook
 receives a domain-separated Ed25519 signature and the monitor public DID key.
 No token is sent in a URL or ordinary log.
@@ -62,7 +68,7 @@ After independently verifying a DID's current full state and expected CID:
 
 ```bash
 bun run monitor:migrate
-bun run monitor:enroll -- "$did" "$current_operation_cid" "$user_https_webhook"
+bun run monitor:enroll -- "$did" "$current_operation_cid" "$user_https_webhook" reviewed-plc-data.json
 bun run monitor:run
 ```
 
@@ -76,10 +82,61 @@ bun run monitor:approve -- "$did" "$new_operation_cid" reviewed-plc-data.json
 bun run monitor:attest -- "$did" "$transfer_id" "$new_operation_cid"
 ```
 
+For a newly registered DID whose reviewed bootstrap is still the current genesis,
+complete contiguous backfill, deliver the enrollment notification and complete a
+fresh healthy poll, then produce the separate onboarding artifact:
+
+```bash
+umask 077
+bun run monitor:attest-onboarding -- "$did" "$genesis_cid" > onboarding-attestation.json
+```
+
+This attestation has no transfer ID or prior checkpoint. It binds the reviewed
+genesis state digest and export sequence under
+`hail.independent-plc-onboarding-monitor.v1\0`. It refuses stale health, incomplete
+backfill, changed state or any recorded coverage/export/invalid-log gap.
+
 The monitor refuses an attestation if notification has not completed, the
 operation is not current/approved, the last healthy poll is stale, or it has
 detected a coverage or export gap. It prints only the signed attestation and
 the public monitor key, never provider or user identity private keys.
+
+HTTPS-directory enrollment requires the reviewed state file before key/database/
+network access. It is bounded at 1 MiB, uses strict JSON/PLC state validation and
+must match the exact CID and complete validated state. The original bootstrap
+CID/state/time is retained separately; later approval does not overwrite it.
+The three-argument form remains private-HTTP-POC convenience, not reviewed public
+bootstrap evidence. Existing enrollments are not retroactively relabeled.
+
+Reviewed enrollment plus completed contiguous backfill produces **v2** coverage,
+using `hail.independent-plc-monitor.v2\0`: the existing fields plus original
+bootstrap CID, SHA-256/deterministic-CBOR full-state digest and processed export
+sequence. Public cutover requires v2, a canonical pre-cutover checkpoint matching
+both readers, and observation within five minutes. Legacy enrollments produce
+the original v1 payload/context, which remains verifiable but is rejected by the
+public gate. The export sequence is a monitor assertion, not a cryptographic
+directory checkpoint. There is no command to skip to an arbitrary late cursor.
+
+### Migrations 3-4 and rollback
+
+Stop the old monitor/attestation processes before upgrading; deploy one consistent
+runtime before using v2 evidence. Mixed-version production attestation is not a
+supported rollout. `monitor:migrate` preserves all existing cursors, enrollment,
+observation, alert and approval rows and starts `caught_up=false`. It creates no
+reviewed bootstrap records for old enrollments. Repeated migration is checksum
+checked and does not reset a later successful catch-up.
+
+With all processes stopped, `migrations/rollback/0003_backfill_readiness.sql`
+permits a legacy rollback only when enrolled monitors are caught up, no later
+migration exists and no reviewed checkpoint would be lost. It refuses incomplete
+backfill and any sole reviewed-bootstrap record. Re-upgrade preserves legacy
+rows but requires new catch-up; rollback is not production-readiness proof.
+Preserve old enrollment history when planning any new reviewed ceremony rather
+than deleting it to manufacture a v2 label.
+
+Migration 4 expands the closed alert category set for the delivered onboarding
+enrollment notification. Its guarded rollback refuses while any such notification
+evidence exists or a later monitor migration is installed.
 
 ## Production Work Still Required
 
@@ -87,7 +144,11 @@ the public monitor key, never provider or user identity private keys.
 sequence zero and requires contiguous results. A large public directory
 requires a **verified bootstrap checkpoint** or complete backfill before it
 can assert coverage; an arbitrary late cursor is not proof of monitoring.
-The POC has not selected independently operated PLC mirrors or deployed this
+The reference now implements reviewed per-DID checkpoints plus complete-backfill
+readiness. Fast bootstrap from an independently verified late global checkpoint
+remains unimplemented. External health supervision is also needed to alert while
+the monitor process itself is offline. The POC has not selected independently
+operated PLC mirrors or deployed this
 project on a separate user-owned host. The same-VPS private-directory
 deployment has proven signed HTTPS webhook delivery and durable restart
 behavior with a disposable DID; it does not prove host independence.

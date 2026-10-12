@@ -11,7 +11,8 @@ export class MonitorDatabase {
       version integer PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())`;
     await this.sql.begin(async (tx) => {
       await tx`SELECT pg_advisory_xact_lock(686169154)`;
-      for (const [version, filename] of [[1, "0001_monitor.sql"], [2, "0002_user_approved_expectations.sql"]] as const) {
+      for (const [version, filename] of [[1, "0001_monitor.sql"], [2, "0002_user_approved_expectations.sql"],
+        [3, "0003_backfill_readiness.sql"], [4, "0004_onboarding_notification.sql"]] as const) {
         const contents = await Bun.file(new URL(`../migrations/${filename}`, import.meta.url)).text();
         const checksum = createHash("sha256").update(contents).digest("hex");
         const rows = await tx<{ checksum: string }[]>`SELECT checksum FROM schema_migrations WHERE version = ${version}`;

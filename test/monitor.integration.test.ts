@@ -10,7 +10,7 @@ import { PlcMonitor } from "../src/monitor.js";
 import { MonitorNotifier, type AlertTransport } from "../src/notifier.js";
 import type { MonitorPlcClient } from "../src/plc.js";
 import { MonitorSigner } from "../src/signing.js";
-import { verifyMonitorAttestation } from "../../hail-server-ts/src/migration/monitor-attestation.js";
+import { verifyMonitorAttestation, verifyOnboardingMonitorAttestation } from "../../hail-server-ts/src/migration/monitor-attestation.js";
 
 const integration = process.env.DATABASE_URL ? describe : describe.skip;
 
@@ -76,10 +76,11 @@ integration("independent monitor durable cursor", () => {
       await db.sql`DELETE FROM monitor_alerts WHERE did = ${did}`;
       await db.sql`DELETE FROM monitor_observations WHERE did = ${did}`;
       await db.sql`DELETE FROM monitor_approvals WHERE did = ${did}`;
+      await db.sql`DELETE FROM monitor_bootstrap_checkpoints WHERE did = ${did}`;
       await db.sql`DELETE FROM monitored_dids WHERE did = ${did}`;
       const remaining = await db.sql<{ count: number }[]>`SELECT count(*)::int AS count FROM monitored_dids`;
       if (remaining[0]?.count === 0) {
-        await db.sql`UPDATE monitor_cursor SET last_seq = 0, last_healthy_at = NULL WHERE singleton = true`;
+        await db.sql`UPDATE monitor_cursor SET last_seq = 0, last_healthy_at = NULL, caught_up = false WHERE singleton = true`;
       }
     }
     await db.close();
@@ -182,4 +183,176 @@ integration("independent monitor durable cursor", () => {
       observed_at: Math.floor(tick / 1000) });
     expect((await verifyMonitorAttestation(signed, signer.publicDidKey, Math.floor(tick / 1000))).did).toBe(did);
   });
+
+  it("preserves legacy enrollment/history/alerts/approvals through rollback and re-upgrade without inventing bootstrap evidence", async () => {
+    corrupt = false;
+    const monitor = new PlcMonitor(db.sql, client, observed);
+    expect((await monitor.poll()).state).toBe("current");
+    const fingerprint = async () => Promise.all(["monitored_dids", "monitor_observations", "monitor_alerts", "monitor_approvals", "monitor_cursor"].map(async table =>
+      JSON.stringify(await db.sql.unsafe(`SELECT to_jsonb(row) - 'caught_up' AS value FROM ${table} row ORDER BY to_jsonb(row)::text`))));
+    const before = await fingerprint(), connection = await db.sql.reserve();
+    try {
+      await connection.unsafe(await Bun.file(new URL("../migrations/rollback/0004_onboarding_notification.sql", import.meta.url)).text());
+      await connection.unsafe(await Bun.file(new URL("../migrations/rollback/0003_backfill_readiness.sql", import.meta.url)).text());
+    } catch (error) { await connection.unsafe("ROLLBACK"); throw error; }
+    finally { connection.release(); }
+    expect(await fingerprint()).toEqual(before);
+    await db.migrate(); expect(await fingerprint()).toEqual(before);
+    expect((await db.sql<{ caught_up: boolean }[]>`SELECT caught_up FROM monitor_cursor`)[0]!.caught_up).toBe(false);
+    expect(await db.sql`SELECT did FROM monitor_bootstrap_checkpoints`).toHaveLength(0);
+    await db.migrate(); expect(await fingerprint()).toEqual(before);
+  });
+});
+
+integration("reviewed bootstrap and durable backfill readiness", () => {
+  it("reports lost coverage for enrollment that has never completed its first backfill", async () => {
+    const db = new MonitorDatabase(process.env.DATABASE_URL!);
+    let did = "";
+    try {
+      await db.migrate();
+      const key = await P256Keypair.create();
+      const operation = await signOperation({ type: "plc_operation", prev: null, rotationKeys: [key.did()],
+        verificationMethods: {}, services: {}, alsoKnownAs: [] }, key);
+      did = await didForCreateOp(operation);
+      const cid = (await cidForCbor(operation)).toString();
+      let tick = Date.now();
+      const client: MonitorPlcClient = {
+        async exportAfter() { throw new Error("Export unavailable"); }, async getOperationLog() { return [operation]; },
+        async getDocumentData() { return (await validateOperationLog(did, [operation]))!; },
+        async getAuditableLog() { return [{ did, operation, cid, nullified: false, createdAt: new Date(tick).toISOString() }]; },
+      };
+      const monitor = new PlcMonitor(db.sql, client, () => new Date(tick));
+      await monitor.enroll(did, cid, "https://owner.example.com/alerts");
+      tick += 25 * 3600_000;
+      expect(await monitor.poll()).toMatchObject({ state: "unavailable", alerts: 1 });
+      expect(await monitor.poll()).toMatchObject({ state: "unavailable", alerts: 0 });
+      expect(await db.sql`SELECT id FROM monitor_alerts WHERE did=${did} AND category='coverage-lost'`).toHaveLength(1);
+      expect((await db.sql<{ last_healthy_at: Date | null }[]>`SELECT last_healthy_at FROM monitor_cursor`)[0]!.last_healthy_at).toBeNull();
+    } finally {
+      if (did) { await db.sql`DELETE FROM monitor_alerts WHERE did=${did}`; await db.sql`DELETE FROM monitored_dids WHERE did=${did}`; }
+      await db.sql`UPDATE monitor_cursor SET last_seq=0,last_healthy_at=NULL,caught_up=false WHERE singleton=true`;
+      await db.close();
+    }
+  });
+
+  it("refuses partial/outage/gapped coverage across restart and preserves all rows through guarded migration rollback", async () => {
+    const db = new MonitorDatabase(process.env.DATABASE_URL!);
+    let did = "";
+    try {
+      await db.migrate();
+      expect((await db.sql`SELECT did FROM monitored_dids`)).toHaveLength(0);
+      const key = await P256Keypair.create();
+      const genesis = await signOperation({ type: "plc_operation", prev: null, rotationKeys: [key.did()],
+        verificationMethods: {}, services: {}, alsoKnownAs: [] }, key);
+      did = await didForCreateOp(genesis);
+      const genesisCid = (await cidForCbor(genesis)).toString();
+      let log: CompatibleOpOrTombstone[] = [genesis], tick = Date.now(), unavailable = false, corruptAudit = false;
+      let exported: ExportedOpWithSeq[] = [{ did, operation: genesis, cid: genesisCid, seq: 1,
+        type: "sequenced_op", createdAt: new Date(tick).toISOString() }];
+      const client: MonitorPlcClient = {
+        async exportAfter(after, count) { if (unavailable) throw new Error("Offline"); return exported.filter(entry => entry.seq > after).slice(0, count); },
+        async getOperationLog() { return log; },
+        async getDocumentData() { return (await validateOperationLog(did, log))!; },
+        async getAuditableLog() { return Promise.all(log.map(async operation => ({ did, operation,
+          cid: corruptAudit ? genesisCid : (await cidForCbor(operation)).toString(), nullified: false, createdAt: new Date(tick).toISOString() }))); },
+      };
+      const monitor = new PlcMonitor(db.sql, client, () => new Date(tick));
+      const reviewed = (await validateOperationLog(did, log))!;
+      await expect(monitor.enroll(did, genesisCid, "https://owner.example.com/alerts",
+        { ...reviewed, alsoKnownAs: ["at://unreviewed.example.com"] })).rejects.toThrow("Reviewed bootstrap");
+      expect((await db.sql`SELECT did FROM monitored_dids`)).toHaveLength(0);
+      await monitor.enroll(did, genesisCid, "https://owner.example.com/alerts", reviewed);
+      expect((await db.sql<{ last_healthy_at: Date | null }[]>`SELECT last_healthy_at FROM monitor_cursor`)[0]!.last_healthy_at).toBeNull();
+      expect(await monitor.poll(1)).toMatchObject({ state: "backfilling", lastSeq: 1 });
+      expect(await monitor.poll(1)).toMatchObject({ state: "current", lastSeq: 1 });
+      const signer = new MonitorSigner(generateKeyPairSync("ed25519").privateKey);
+      await expect(monitor.attestOnboarding(did, genesisCid, "https://monitor.example.com", signer)).rejects.toThrow("coverage");
+      expect(await new MonitorNotifier(db.sql, signer, { async send() { return 204; } }).sendOne()).toBe("sent");
+      const onboarding = await monitor.attestOnboarding(did, genesisCid, "https://monitor.example.com", signer);
+      expect(await verifyOnboardingMonitorAttestation(onboarding, signer.publicDidKey, Math.floor(tick / 1000))).toMatchObject({
+        did, operation_cid: genesisCid, export_sequence: 1,
+      });
+      const { sig, ...unsigned } = genesis;
+      const updated = await signOperation({ ...unsigned, prev: genesisCid, alsoKnownAs: ["at://approved.example.com"] }, key);
+      const updatedCid = (await cidForCbor(updated)).toString();
+      log.push(updated); tick += 1000;
+      exported.push({ did, operation: updated, cid: updatedCid, seq: 2, type: "sequenced_op", createdAt: new Date(tick).toISOString() });
+      expect(await monitor.poll(1)).toMatchObject({ state: "backfilling", lastSeq: 2, alerts: 1 });
+      expect(await new MonitorNotifier(db.sql, signer, { async send() { return 204; } }).sendOne()).toBe("sent");
+      await monitor.approveExpected(did, updatedCid, (await validateOperationLog(did, log))!);
+      const restarted = new PlcMonitor(db.sql, client, () => new Date(tick));
+      const attest = () => restarted.attest(did, randomUUID(), updatedCid, "https://monitor.example.com", signer);
+      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      const rollback = await Bun.file(new URL("../migrations/rollback/0003_backfill_readiness.sql", import.meta.url)).text();
+      const applyRollback = async () => {
+        const connection = await db.sql.reserve();
+        try { await connection.unsafe(rollback); }
+        catch (error) { await connection.unsafe("ROLLBACK"); throw error; }
+        finally { connection.release(); }
+      };
+      await expect(applyRollback()).rejects.toThrow("later monitor migrations");
+      expect(await restarted.poll(1)).toMatchObject({ state: "current", lastSeq: 2 });
+      const signed = await attest();
+      expect(await verifyMonitorAttestation(signed, signer.publicDidKey, Math.floor(tick / 1000), 300)).toMatchObject({
+        version: 2, operation_cid: updatedCid, bootstrap_cid: genesisCid, export_sequence: 2 });
+      const originalCheckpoint = await db.sql<{ operation_cid: string; reviewed_state: unknown }[]>`SELECT operation_cid, reviewed_state FROM monitor_bootstrap_checkpoints WHERE did=${did}`;
+      expect(originalCheckpoint[0]!.operation_cid).toBe(genesisCid);
+      const storedState = originalCheckpoint[0]!.reviewed_state;
+      expect(typeof storedState === "string" ? JSON.parse(storedState) : storedState).toEqual(reviewed);
+      tick += 301_000;
+      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      expect(await restarted.poll(1)).toMatchObject({ state: "current", lastSeq: 2 });
+      unavailable = true;
+      expect(await restarted.poll(1)).toMatchObject({ state: "unavailable", lastSeq: 2 });
+      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      unavailable = false;
+      expect(await restarted.poll(1)).toMatchObject({ state: "current" });
+      corruptAudit = true;
+      await expect(attest()).rejects.toThrow("audit");
+      corruptAudit = false;
+      // Assert cursor-first locking: attestation waits for a currently admitted
+      // outage poll and cannot sign using its previously committed caught_up=true.
+      let admitted!: () => void, release!: () => void;
+      const started = new Promise<void>(resolve => { admitted = resolve; });
+      const blocked = new Promise<void>(resolve => { release = resolve; });
+      const racingClient = { ...client, async exportAfter() { admitted(); await blocked; throw new Error("Offline"); } };
+      const racingPoll = new PlcMonitor(db.sql, racingClient, () => new Date(tick)).poll(1);
+      await started;
+      let settled = false;
+      const refused = expect(attest().finally(() => { settled = true; })).rejects.toThrow("uninterrupted coverage");
+      await new Promise(resolve => setTimeout(resolve, 25)); expect(settled).toBe(false);
+      release(); expect((await racingPoll).state).toBe("unavailable"); await refused;
+      expect(await restarted.poll(1)).toMatchObject({ state: "current" });
+      exported = [...exported, { ...exported[1]!, seq: 4 }];
+      expect(await restarted.poll(1)).toMatchObject({ state: "gap", lastSeq: 2 });
+      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      exported.pop();
+      expect(await restarted.poll(1)).toMatchObject({ state: "current" });
+      // Catch-up never erases a durable gap, even once the export reads again.
+      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      const fingerprint = async () => Promise.all(["monitored_dids", "monitor_observations", "monitor_alerts", "monitor_approvals", "monitor_cursor"].map(async table => {
+        const rows = await db.sql.unsafe(`SELECT to_jsonb(row) - 'caught_up' AS value FROM ${table} row ORDER BY to_jsonb(row)::text`);
+        return JSON.stringify(rows);
+      }));
+      const before = await fingerprint();
+      const rollbackNotification = await Bun.file(new URL("../migrations/rollback/0004_onboarding_notification.sql", import.meta.url)).text();
+      const connection = await db.sql.reserve();
+      try { await expect(connection.unsafe(rollbackNotification)).rejects.toThrow("notification evidence"); }
+      finally { await connection.unsafe("ROLLBACK"); connection.release(); }
+      await expect(applyRollback()).rejects.toThrow("later monitor migrations"); expect(await fingerprint()).toEqual(before);
+      await db.migrate(); expect(await fingerprint()).toEqual(before);
+      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+    } finally {
+      await db.migrate();
+      if (did) {
+        await db.sql`DELETE FROM monitor_bootstrap_checkpoints WHERE did = ${did}`;
+        await db.sql`DELETE FROM monitor_alerts WHERE did = ${did}`;
+        await db.sql`DELETE FROM monitor_observations WHERE did = ${did}`;
+        await db.sql`DELETE FROM monitor_approvals WHERE did = ${did}`;
+        await db.sql`DELETE FROM monitored_dids WHERE did = ${did}`;
+      }
+      await db.sql`UPDATE monitor_cursor SET last_seq = 0, last_healthy_at = NULL, caught_up = false WHERE singleton = true`;
+      await db.close();
+    }
+  }, 30_000);
 });

@@ -14,6 +14,7 @@
     "monitor:enroll": "bun src/cli/enroll.ts",
     "monitor:approve": "bun src/cli/approve.ts",
     "monitor:attest": "bun src/cli/attest.ts",
+    "monitor:attest-onboarding": "bun src/cli/attest-onboarding.ts",
     "monitor:run": "bun src/cli/run.ts",
     "monitor:keygen": "bun src/cli/generate-key.ts"
   },

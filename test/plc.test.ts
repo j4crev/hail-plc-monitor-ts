@@ -1,11 +1,37 @@
 import { describe, expect, it, vi } from "vitest";
-import { BoundedMonitorPlcClient } from "../src/plc.js";
-import { assertWebhookUrl } from "../src/monitor.js";
+import { BoundedMonitorPlcClient, type MonitorPlcClient } from "../src/plc.js";
+import { assertWebhookUrl, PlcMonitor } from "../src/monitor.js";
+import type { MonitorSigner } from "../src/signing.js";
+import type { SQL } from "bun";
 import { PinnedHttpsAlertTransport, publicAddress } from "../src/notifier.js";
 
 const did = `did:plc:${"a".repeat(24)}`;
 
 describe("monitor network boundaries", () => {
+  it("rejects invalid attestation subjects before any reads or signing", async () => {
+    const read = vi.fn(), sign = vi.fn();
+    const client = { getOperationLog: read, getDocumentData: read, getAuditableLog: read } as unknown as MonitorPlcClient;
+    const monitor = new PlcMonitor({} as SQL, client);
+    const signer = { signCoverage: sign } as unknown as MonitorSigner;
+    for (const [transfer, origin] of [["invalid", "https://monitor.example.com"],
+      ["00000000-0000-0000-0000-000000000000", "https://monitor.example.com/"],
+      ["00000000-0000-0000-0000-000000000000", "https://127.0.0.1"]]) {
+      await expect(monitor.attest(did, transfer!, "bafkreia", origin!, signer)).rejects.toThrow();
+    }
+    expect(read).not.toHaveBeenCalled(); expect(sign).not.toHaveBeenCalled();
+  });
+
+  it("requires a reviewed checkpoint for public enrollment before key/database/network access", async () => {
+    const child = Bun.spawn([process.execPath, "src/cli/enroll.ts", did, "bafkreiexample", "https://owner.example.com/alerts"], {
+      cwd: new URL("../", import.meta.url).pathname,
+      env: { ...process.env, PLC_DIRECTORY_URL: "https://plc.directory", DATABASE_URL: "not-a-database-url",
+        MONITOR_PRIVATE_KEY_FILE: "/must-not-read/nonexistent.pkcs8" }, stdout: "pipe", stderr: "pipe",
+    });
+    const [exit, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()]);
+    expect(exit).toBe(1); expect(stdout).toBe(""); expect(stderr).toContain("owner-reviewed full-state checkpoint");
+    expect(stderr).not.toContain("ENOENT");
+  });
+
   it("pins reads to the configured PLC origin, rejects redirects and bounds export pages", async () => {
     const request = vi.fn<(url: string, init: RequestInit) => Promise<Response>>(async () => new Response(""));
     const client = new BoundedMonitorPlcClient("https://plc.directory/", request, 50, 1024);
