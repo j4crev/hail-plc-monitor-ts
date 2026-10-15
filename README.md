@@ -10,6 +10,10 @@ Hosting it on infrastructure controlled
 by a Hail provider is a **bootstrap convenience**, not independent coverage
 under `../hailproto/spec/account-onboarding.md`.
 
+The prepared same-host public bootstrap profile is documented in
+[`deploy/public`](deploy/public/README.md). It is intentionally not started while
+the PLC replica is consuming the VPS for its initial backfill.
+
 This project is intentionally a sibling of `hailproto`, `hail-server-ts`, and
 the pinned official `did-method-plc` checkout. It cannot monitor the live POC
 DIDs via the public PLC registry because those DIDs exist only in its private

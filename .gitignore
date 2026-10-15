@@ -2,6 +2,7 @@ node_modules/
 .opencode/
 .env
 secrets/
+deploy/public/reviewed/
 *.sqlite*
 *.tsbuildinfo
 dist/
