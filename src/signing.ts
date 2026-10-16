@@ -6,7 +6,9 @@ import { encodeDeterministic, type HailValue } from "@hailproto/codec";
 const ALERT_CONTEXT = new TextEncoder().encode("hail.plc-monitor-alert.v1\0");
 const COVERAGE_CONTEXT = new TextEncoder().encode("hail.independent-plc-monitor.v1\0");
 const REVIEWED_COVERAGE_CONTEXT = new TextEncoder().encode("hail.independent-plc-monitor.v2\0");
+const DID_COVERAGE_CONTEXT = new TextEncoder().encode("hail.independent-plc-monitor.v3\0");
 const ONBOARDING_COVERAGE_CONTEXT = new TextEncoder().encode("hail.independent-plc-onboarding-monitor.v1\0");
+const DID_ONBOARDING_CONTEXT = new TextEncoder().encode("hail.independent-plc-onboarding-monitor.v2\0");
 
 export class MonitorSigner {
   readonly publicDidKey: string;
@@ -33,20 +35,21 @@ export class MonitorSigner {
 
   signAlert(bytes: Uint8Array): Uint8Array { return this.sign(ALERT_CONTEXT, bytes); }
 
-  signCoverage(payload: { type: "hail.plc-monitor-attestation"; version: 1 | 2;
+  signCoverage(payload: { type: "hail.plc-monitor-attestation"; version: 1 | 2 | 3;
     did: string; transfer_id: string; operation_cid: string; monitor_origin: string;
     coverage_since: number; observed_at: number; bootstrap_cid?: string;
     bootstrap_state_digest?: string; export_sequence?: number }): { payloadBytes: Uint8Array; signature: Uint8Array } {
     const payloadBytes = encodeDeterministic(payload as unknown as HailValue);
-    return { payloadBytes, signature: this.sign(payload.version === 2 ? REVIEWED_COVERAGE_CONTEXT : COVERAGE_CONTEXT, payloadBytes) };
+    const context=payload.version===3?DID_COVERAGE_CONTEXT:payload.version===2?REVIEWED_COVERAGE_CONTEXT:COVERAGE_CONTEXT;
+    return { payloadBytes, signature: this.sign(context, payloadBytes) };
   }
 
-  signOnboardingCoverage(payload: { type: "hail.plc-onboarding-monitor-attestation"; version: 1;
+  signOnboardingCoverage(payload: { type: "hail.plc-onboarding-monitor-attestation"; version: 1 | 2;
     did: string; operation_cid: string; monitor_origin: string; coverage_since: number;
-    observed_at: number; bootstrap_state_digest: string; export_sequence: number }): {
+    observed_at: number; bootstrap_state_digest: string; export_sequence?: number }): {
       payloadBytes: Uint8Array; signature: Uint8Array } {
     const payloadBytes = encodeDeterministic(payload as unknown as HailValue);
-    return { payloadBytes, signature: this.sign(ONBOARDING_COVERAGE_CONTEXT, payloadBytes) };
+    return { payloadBytes, signature: this.sign(payload.version===2?DID_ONBOARDING_CONTEXT:ONBOARDING_COVERAGE_CONTEXT, payloadBytes) };
   }
 
   private sign(context: Uint8Array, bytes: Uint8Array): Uint8Array {

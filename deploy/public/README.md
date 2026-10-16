@@ -1,8 +1,7 @@
 # Provider-bootstrap public monitor
 
-This profile runs the monitor worker and its private PostgreSQL database. It
-consumes the canonical `https://plc.directory/export` feed directly; it does not
-use the read replica because the official replica has no export endpoint.
+This profile runs the monitor worker and its private PostgreSQL database. It polls
+each enrolled DID's canonical `https://plc.directory/<did>/log/audit` endpoint.
 
 Hosting this stack beside a Hail provider or its replica is useful for pre-alpha
 testing but is not independent monitoring.
@@ -32,7 +31,7 @@ alert destinations are outbound HTTPS webhooks.
 
 ## Start and inspect
 
-Start after the PLC replica backfill no longer needs the host's full CPU capacity:
+Start after DNS, the monitor key and alert webhook are ready:
 
 ```bash
 docker compose --env-file .env up -d --wait
@@ -41,8 +40,8 @@ docker compose --env-file .env exec db \
   psql -U monitor -d monitor -c 'SELECT last_seq,caught_up,last_healthy_at FROM monitor_cursor'
 ```
 
-The monitor starts at sequence zero. A full export page remains `backfilling`;
-only a short or empty contiguous page marks it caught up.
+No global PLC backfill is required. A fresh successful poll must validate every
+enrolled DID before the monitor can attest.
 
 ## Enroll the canary
 

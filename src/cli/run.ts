@@ -39,5 +39,5 @@ async function notify() {
 }
 await poll();
 await notify();
-setInterval(() => { void poll(); }, 60_000);
+setInterval(() => { void poll(); }, 240_000);
 setInterval(() => { void notify(); }, 5_000);

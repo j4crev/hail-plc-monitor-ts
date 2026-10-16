@@ -31,6 +31,7 @@ integration("independent monitor durable cursor", () => {
   let log: CompatibleOpOrTombstone[];
   let exported: ExportedOpWithSeq[];
   let tick = Date.now();
+  const auditEpoch=tick;
   let corrupt = false;
   const observed = () => new Date(tick);
   const client: MonitorPlcClient = {
@@ -42,9 +43,9 @@ integration("independent monitor durable cursor", () => {
       return corrupt ? { ...state, alsoKnownAs: ["https://tampered.example.com"] } : state;
     },
     async getAuditableLog() {
-      return Promise.all(log.map(async (operation) => ({ did, operation,
-        cid: (await cidForCbor(operation)).toString(), nullified: false,
-        createdAt: observed().toISOString() })));
+      return Promise.all(log.map(async (operation,index) => ({ did, operation,
+        cid: corrupt&&index===log.length-1?cid:(await cidForCbor(operation)).toString(), nullified: false,
+        createdAt: new Date(auditEpoch+index*1000).toISOString() })));
     },
   };
 
@@ -89,7 +90,7 @@ integration("independent monitor durable cursor", () => {
   it("enrolls a validated DID, advances an exact sequence and alerts on unexpected changes", async () => {
     const monitor = new PlcMonitor(db.sql, client, observed);
     await monitor.enroll(did, cid, "https://user.example.com/alerts");
-    expect(await monitor.poll()).toMatchObject({ state: "current", lastSeq: 1, inspected: 1, alerts: 0 });
+    expect(await monitor.poll()).toMatchObject({ state: "current", inspected: 0, alerts: 0 });
     const updated = await signOperation({ type: "plc_operation", rotationKeys: [key.did()],
       verificationMethods: { "hail-identity": (genesis as { verificationMethods: Record<string, string> }).verificationMethods["hail-identity"]!,
         "hail-messaging": (genesis as { verificationMethods: Record<string, string> }).verificationMethods["hail-messaging"]! },
@@ -100,12 +101,12 @@ integration("independent monitor durable cursor", () => {
     const updateCid = (await cidForCbor(updated)).toString();
     exported.push({ did, operation: updated, cid: updateCid, seq: 2, type: "sequenced_op",
       createdAt: observed().toISOString() });
-    expect(await monitor.poll()).toMatchObject({ state: "current", lastSeq: 2, inspected: 1, alerts: 1 });
+    expect(await monitor.poll()).toMatchObject({ state: "current", inspected: 1, alerts: 1 });
     const alerts = await db.sql<{ category: string; sent_at: Date | null }[]>`
       SELECT category, sent_at FROM monitor_alerts WHERE did = ${did}`;
     expect(alerts[0]?.category).toBe("unexpected-operation");
     expect(alerts[0]?.sent_at).toBeNull();
-    expect(await monitor.poll()).toMatchObject({ state: "current", lastSeq: 2, alerts: 0 });
+    expect(await monitor.poll()).toMatchObject({ state: "current", alerts: 0 });
     expect((await db.sql`SELECT id FROM monitor_alerts WHERE did = ${did}`)).toHaveLength(1);
   });
 
@@ -128,13 +129,13 @@ integration("independent monitor durable cursor", () => {
   it("records lost coverage after downtime and preserves the cursor after a restart", async () => {
     tick += 25 * 3600 * 1000;
     const monitor = new PlcMonitor(db.sql, client, observed);
-    expect(await monitor.poll()).toMatchObject({ state: "current", lastSeq: 2, alerts: 1 });
+    expect(await monitor.poll()).toMatchObject({ state: "current", alerts: 1 });
     const restarted = new PlcMonitor(db.sql, client, observed);
-    expect(await restarted.poll()).toMatchObject({ state: "current", lastSeq: 2, alerts: 0 });
+    expect(await restarted.poll()).toMatchObject({ state: "current", alerts: 0 });
     expect((await db.sql`SELECT id FROM monitor_alerts WHERE category = 'coverage-lost'`)).toHaveLength(1);
   });
 
-  it("does not skip an export gap or accept an inconsistent operation log", async () => {
+  it("rejects an inconsistent DID audit", async () => {
     const current = await signOperation({ type: "plc_operation", rotationKeys: [key.did()],
       verificationMethods: (genesis as { verificationMethods: Record<string, string> }).verificationMethods,
       alsoKnownAs: ["https://again.example.com"],
@@ -144,14 +145,9 @@ integration("independent monitor durable cursor", () => {
     exported.push({ did, operation: current, cid: newCid, seq: 4, type: "sequenced_op",
       createdAt: observed().toISOString() });
     const monitor = new PlcMonitor(db.sql, client, observed);
-    expect(await monitor.poll()).toMatchObject({ state: "gap", lastSeq: 2, alerts: 1 });
-    exported[exported.length - 1]!.seq = 3;
     log = [...log, current];
     corrupt = true;
-    expect(await monitor.poll()).toMatchObject({ state: "invalid-log", lastSeq: 2, alerts: 1 });
-    const cursor = await db.sql<{ last_seq: number | string | bigint }[]>`
-      SELECT last_seq FROM monitor_cursor WHERE singleton = true`;
-    expect(Number(cursor[0]?.last_seq)).toBe(2);
+    expect(await monitor.poll()).toMatchObject({ state: "invalid-log", alerts: 1 });
   });
 
   it("durably retries signed user alerts and interoperates with provider monitor verification", async () => {
@@ -184,7 +180,7 @@ integration("independent monitor durable cursor", () => {
     expect((await verifyMonitorAttestation(signed, signer.publicDidKey, Math.floor(tick / 1000))).did).toBe(did);
   });
 
-  it("preserves legacy enrollment/history/alerts/approvals through rollback and re-upgrade without inventing bootstrap evidence", async () => {
+  it("preserves legacy evidence and refuses rollback after per-DID polling", async () => {
     corrupt = false;
     const monitor = new PlcMonitor(db.sql, client, observed);
     expect((await monitor.poll()).state).toBe("current");
@@ -192,13 +188,13 @@ integration("independent monitor durable cursor", () => {
       JSON.stringify(await db.sql.unsafe(`SELECT to_jsonb(row) - 'caught_up' AS value FROM ${table} row ORDER BY to_jsonb(row)::text`))));
     const before = await fingerprint(), connection = await db.sql.reserve();
     try {
-      await connection.unsafe(await Bun.file(new URL("../migrations/rollback/0004_onboarding_notification.sql", import.meta.url)).text());
-      await connection.unsafe(await Bun.file(new URL("../migrations/rollback/0003_backfill_readiness.sql", import.meta.url)).text());
+      await expect(connection.unsafe(await Bun.file(new URL("../migrations/rollback/0005_per_did_audit_polling.sql", import.meta.url)).text()))
+        .rejects.toThrow("per-DID monitor evidence");
+      await connection.unsafe("ROLLBACK");
     } catch (error) { await connection.unsafe("ROLLBACK"); throw error; }
     finally { connection.release(); }
     expect(await fingerprint()).toEqual(before);
     await db.migrate(); expect(await fingerprint()).toEqual(before);
-    expect((await db.sql<{ caught_up: boolean }[]>`SELECT caught_up FROM monitor_cursor`)[0]!.caught_up).toBe(false);
     expect(await db.sql`SELECT did FROM monitor_bootstrap_checkpoints`).toHaveLength(0);
     await db.migrate(); expect(await fingerprint()).toEqual(before);
   });
@@ -216,13 +212,15 @@ integration("reviewed bootstrap and durable backfill readiness", () => {
       did = await didForCreateOp(operation);
       const cid = (await cidForCbor(operation)).toString();
       let tick = Date.now();
+      let unavailable=false;
       const client: MonitorPlcClient = {
         async exportAfter() { throw new Error("Export unavailable"); }, async getOperationLog() { return [operation]; },
         async getDocumentData() { return (await validateOperationLog(did, [operation]))!; },
-        async getAuditableLog() { return [{ did, operation, cid, nullified: false, createdAt: new Date(tick).toISOString() }]; },
+        async getAuditableLog() { if(unavailable)throw new Error("Audit unavailable");return [{ did, operation, cid, nullified: false, createdAt: new Date(tick).toISOString() }]; },
       };
       const monitor = new PlcMonitor(db.sql, client, () => new Date(tick));
       await monitor.enroll(did, cid, "https://owner.example.com/alerts");
+      unavailable=true;
       tick += 25 * 3600_000;
       expect(await monitor.poll()).toMatchObject({ state: "unavailable", alerts: 1 });
       expect(await monitor.poll()).toMatchObject({ state: "unavailable", alerts: 0 });
@@ -247,14 +245,15 @@ integration("reviewed bootstrap and durable backfill readiness", () => {
       did = await didForCreateOp(genesis);
       const genesisCid = (await cidForCbor(genesis)).toString();
       let log: CompatibleOpOrTombstone[] = [genesis], tick = Date.now(), unavailable = false, corruptAudit = false;
+      const auditEpoch=tick;
       let exported: ExportedOpWithSeq[] = [{ did, operation: genesis, cid: genesisCid, seq: 1,
         type: "sequenced_op", createdAt: new Date(tick).toISOString() }];
       const client: MonitorPlcClient = {
         async exportAfter(after, count) { if (unavailable) throw new Error("Offline"); return exported.filter(entry => entry.seq > after).slice(0, count); },
         async getOperationLog() { return log; },
         async getDocumentData() { return (await validateOperationLog(did, log))!; },
-        async getAuditableLog() { return Promise.all(log.map(async operation => ({ did, operation,
-          cid: corruptAudit ? genesisCid : (await cidForCbor(operation)).toString(), nullified: false, createdAt: new Date(tick).toISOString() }))); },
+         async getAuditableLog() { if(unavailable)throw new Error("Offline");return Promise.all(log.map(async (operation,index) => ({ did, operation,
+           cid: corruptAudit ? genesisCid : (await cidForCbor(operation)).toString(), nullified: false, createdAt: new Date(auditEpoch+index*1000).toISOString() }))); },
       };
       const monitor = new PlcMonitor(db.sql, client, () => new Date(tick));
       const reviewed = (await validateOperationLog(did, log))!;
@@ -263,26 +262,24 @@ integration("reviewed bootstrap and durable backfill readiness", () => {
       expect((await db.sql`SELECT did FROM monitored_dids`)).toHaveLength(0);
       await monitor.enroll(did, genesisCid, "https://owner.example.com/alerts", reviewed);
       expect((await db.sql<{ last_healthy_at: Date | null }[]>`SELECT last_healthy_at FROM monitor_cursor`)[0]!.last_healthy_at).toBeNull();
-      expect(await monitor.poll(1)).toMatchObject({ state: "backfilling", lastSeq: 1 });
-      expect(await monitor.poll(1)).toMatchObject({ state: "current", lastSeq: 1 });
+      expect(await monitor.poll()).toMatchObject({ state: "current" });
       const signer = new MonitorSigner(generateKeyPairSync("ed25519").privateKey);
       await expect(monitor.attestOnboarding(did, genesisCid, "https://monitor.example.com", signer)).rejects.toThrow("coverage");
       expect(await new MonitorNotifier(db.sql, signer, { async send() { return 204; } }).sendOne()).toBe("sent");
       const onboarding = await monitor.attestOnboarding(did, genesisCid, "https://monitor.example.com", signer);
       expect(await verifyOnboardingMonitorAttestation(onboarding, signer.publicDidKey, Math.floor(tick / 1000))).toMatchObject({
-        did, operation_cid: genesisCid, export_sequence: 1,
+        did, operation_cid: genesisCid, version:2,
       });
       const { sig, ...unsigned } = genesis;
       const updated = await signOperation({ ...unsigned, prev: genesisCid, alsoKnownAs: ["at://approved.example.com"] }, key);
       const updatedCid = (await cidForCbor(updated)).toString();
       log.push(updated); tick += 1000;
       exported.push({ did, operation: updated, cid: updatedCid, seq: 2, type: "sequenced_op", createdAt: new Date(tick).toISOString() });
-      expect(await monitor.poll(1)).toMatchObject({ state: "backfilling", lastSeq: 2, alerts: 1 });
+      expect(await monitor.poll()).toMatchObject({ state: "current", alerts: 1 });
       expect(await new MonitorNotifier(db.sql, signer, { async send() { return 204; } }).sendOne()).toBe("sent");
       await monitor.approveExpected(did, updatedCid, (await validateOperationLog(did, log))!);
       const restarted = new PlcMonitor(db.sql, client, () => new Date(tick));
       const attest = () => restarted.attest(did, randomUUID(), updatedCid, "https://monitor.example.com", signer);
-      await expect(attest()).rejects.toThrow("uninterrupted coverage");
       const rollback = await Bun.file(new URL("../migrations/rollback/0003_backfill_readiness.sql", import.meta.url)).text();
       const applyRollback = async () => {
         const connection = await db.sql.reserve();
@@ -291,22 +288,22 @@ integration("reviewed bootstrap and durable backfill readiness", () => {
         finally { connection.release(); }
       };
       await expect(applyRollback()).rejects.toThrow("later monitor migrations");
-      expect(await restarted.poll(1)).toMatchObject({ state: "current", lastSeq: 2 });
+      expect(await restarted.poll()).toMatchObject({ state: "current" });
       const signed = await attest();
       expect(await verifyMonitorAttestation(signed, signer.publicDidKey, Math.floor(tick / 1000), 300)).toMatchObject({
-        version: 2, operation_cid: updatedCid, bootstrap_cid: genesisCid, export_sequence: 2 });
+        version: 3, operation_cid: updatedCid, bootstrap_cid: genesisCid });
       const originalCheckpoint = await db.sql<{ operation_cid: string; reviewed_state: unknown }[]>`SELECT operation_cid, reviewed_state FROM monitor_bootstrap_checkpoints WHERE did=${did}`;
       expect(originalCheckpoint[0]!.operation_cid).toBe(genesisCid);
       const storedState = originalCheckpoint[0]!.reviewed_state;
       expect(typeof storedState === "string" ? JSON.parse(storedState) : storedState).toEqual(reviewed);
       tick += 301_000;
-      await expect(attest()).rejects.toThrow("uninterrupted coverage");
-      expect(await restarted.poll(1)).toMatchObject({ state: "current", lastSeq: 2 });
+      await expect(attest()).rejects.toThrow();
+      expect(await restarted.poll()).toMatchObject({ state: "current" });
       unavailable = true;
-      expect(await restarted.poll(1)).toMatchObject({ state: "unavailable", lastSeq: 2 });
-      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      expect(await restarted.poll()).toMatchObject({ state: "unavailable" });
+      await expect(attest()).rejects.toThrow();
       unavailable = false;
-      expect(await restarted.poll(1)).toMatchObject({ state: "current" });
+      expect(await restarted.poll()).toMatchObject({ state: "current" });
       corruptAudit = true;
       await expect(attest()).rejects.toThrow("audit");
       corruptAudit = false;
@@ -315,21 +312,14 @@ integration("reviewed bootstrap and durable backfill readiness", () => {
       let admitted!: () => void, release!: () => void;
       const started = new Promise<void>(resolve => { admitted = resolve; });
       const blocked = new Promise<void>(resolve => { release = resolve; });
-      const racingClient = { ...client, async exportAfter() { admitted(); await blocked; throw new Error("Offline"); } };
-      const racingPoll = new PlcMonitor(db.sql, racingClient, () => new Date(tick)).poll(1);
+      const racingClient = { ...client, async getAuditableLog() { admitted(); await blocked; throw new Error("Offline"); } };
+      const racingPoll = new PlcMonitor(db.sql, racingClient, () => new Date(tick)).poll();
       await started;
       let settled = false;
       const refused = expect(attest().finally(() => { settled = true; })).rejects.toThrow("uninterrupted coverage");
       await new Promise(resolve => setTimeout(resolve, 25)); expect(settled).toBe(false);
       release(); expect((await racingPoll).state).toBe("unavailable"); await refused;
-      expect(await restarted.poll(1)).toMatchObject({ state: "current" });
-      exported = [...exported, { ...exported[1]!, seq: 4 }];
-      expect(await restarted.poll(1)).toMatchObject({ state: "gap", lastSeq: 2 });
-      await expect(attest()).rejects.toThrow("uninterrupted coverage");
-      exported.pop();
-      expect(await restarted.poll(1)).toMatchObject({ state: "current" });
-      // Catch-up never erases a durable gap, even once the export reads again.
-      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      expect(await restarted.poll()).toMatchObject({ state: "current" });
       const fingerprint = async () => Promise.all(["monitored_dids", "monitor_observations", "monitor_alerts", "monitor_approvals", "monitor_cursor"].map(async table => {
         const rows = await db.sql.unsafe(`SELECT to_jsonb(row) - 'caught_up' AS value FROM ${table} row ORDER BY to_jsonb(row)::text`);
         return JSON.stringify(rows);
@@ -341,7 +331,7 @@ integration("reviewed bootstrap and durable backfill readiness", () => {
       finally { await connection.unsafe("ROLLBACK"); connection.release(); }
       await expect(applyRollback()).rejects.toThrow("later monitor migrations"); expect(await fingerprint()).toEqual(before);
       await db.migrate(); expect(await fingerprint()).toEqual(before);
-      await expect(attest()).rejects.toThrow("uninterrupted coverage");
+      await expect(attest()).resolves.toHaveProperty("signature");
     } finally {
       await db.migrate();
       if (did) {

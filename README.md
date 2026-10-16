@@ -1,18 +1,17 @@
 # Independent Hail PLC Monitor
 
 Prototype of a user-run monitor for the Hail portable-custody profile. The
-monitor validates DID operation logs, durably tracks the PLC export sequence,
+monitor validates and retains complete per-DID audit logs,
 records unexpected operations and lost coverage, and signs bounded coverage
 attestations for a provider migration. Migration 3 adds reviewed bootstrap
-checkpoint retention and durable backfill readiness; see the candidate
+checkpoint retention and durable polling readiness; see the candidate
 [PLC read-evidence policy](https://github.com/j4crev/hailproto/blob/main/spec/plc-read-evidence.md).
 Hosting it on infrastructure controlled
 by a Hail provider is a **bootstrap convenience**, not independent coverage
 under `../hailproto/spec/account-onboarding.md`.
 
 The prepared same-host public bootstrap profile is documented in
-[`deploy/public`](deploy/public/README.md). It is intentionally not started while
-the PLC replica is consuming the VPS for its initial backfill.
+[`deploy/public`](deploy/public/README.md).
 
 This project is intentionally a sibling of `hailproto`, `hail-server-ts`, and
 the pinned official `did-method-plc` checkout. It cannot monitor the live POC
@@ -22,15 +21,13 @@ explicitly non-independent [same-VPS POC deployment](deploy/poc/README.md).
 
 ## Implemented Boundary
 
-The monitor retains its PostgreSQL export-sequence cursor across restarts and
-rejects a sequence gap rather than silently skipping events. For enrolled
-DIDs, it validates the complete PLC operation log, resulting state, current
-CID and non-nullified audit entry. Every unexpected operation creates a
+For each enrolled DID, the monitor retains the complete canonical audit across
+restarts and rejects omitted, changed, reordered, or de-nullified history. It
+replays the audit into the current state and CID. Every unexpected operation creates a
 durable alert without silently changing the user's expected state. A poll
 after more than 24 hours without coverage records a separate lost-coverage
-alert, including enrollment that never completed its first healthy backfill.
-A full export page reports `backfilling`, not healthy coverage; failed/gapped
-polls clear readiness. Only a short/empty contiguous page establishes catch-up.
+alert, including enrollment that never completed its first healthy poll.
+Failed or invalid polls clear readiness; one fresh successful poll is required.
 Alerts are queued before a DNS-pinned, certificate-validating HTTPS
 webhook attempt, and retry durably until a `2xx` response. The webhook
 receives a domain-separated Ed25519 signature and the monitor public DID key.
@@ -76,7 +73,7 @@ bun run monitor:enroll -- "$did" "$current_operation_cid" "$user_https_webhook" 
 bun run monitor:run
 ```
 
-The process polls the official sequenced PLC export every minute and attempts
+The process polls each enrolled DID's canonical audit every four minutes and attempts
 one due webhook notification every five seconds. For an isolated attempt use
 `monitor:poll` or `monitor:notify`. For a user-reviewed update, supply the
 *complete* reviewed PLC document-data JSON and the exact observed CID:
@@ -87,7 +84,7 @@ bun run monitor:attest -- "$did" "$transfer_id" "$new_operation_cid"
 ```
 
 For a newly registered DID whose reviewed bootstrap is still the current genesis,
-complete contiguous backfill, deliver the enrollment notification and complete a
+deliver the enrollment notification and complete a
 fresh healthy poll, then produce the separate onboarding artifact:
 
 ```bash
@@ -96,9 +93,9 @@ bun run monitor:attest-onboarding -- "$did" "$genesis_cid" > onboarding-attestat
 ```
 
 This attestation has no transfer ID or prior checkpoint. It binds the reviewed
-genesis state digest and export sequence under
-`hail.independent-plc-onboarding-monitor.v1\0`. It refuses stale health, incomplete
-backfill, changed state or any recorded coverage/export/invalid-log gap.
+genesis state digest under `hail.independent-plc-onboarding-monitor.v2\0`. It
+refuses stale health, changed state, regressed history or any recorded coverage/
+invalid-log gap.
 
 The monitor refuses an attestation if notification has not completed, the
 operation is not current/approved, the last healthy poll is stale, or it has
@@ -112,19 +109,18 @@ CID/state/time is retained separately; later approval does not overwrite it.
 The three-argument form remains private-HTTP-POC convenience, not reviewed public
 bootstrap evidence. Existing enrollments are not retroactively relabeled.
 
-Reviewed enrollment plus completed contiguous backfill produces **v2** coverage,
-using `hail.independent-plc-monitor.v2\0`: the existing fields plus original
-bootstrap CID, SHA-256/deterministic-CBOR full-state digest and processed export
-sequence. Public cutover requires v2, a canonical pre-cutover checkpoint matching
-both readers, and observation within five minutes. Legacy enrollments produce
+Reviewed enrollment plus fresh per-DID polling produces **v3** coverage,
+using `hail.independent-plc-monitor.v3\0`: the existing fields plus original
+bootstrap CID and SHA-256/deterministic-CBOR full-state digest. Public cutover requires
+reviewed coverage and a canonical pre-cutover checkpoint matching
+the validated audit, and observation within five minutes. Legacy enrollments produce
 the original v1 payload/context, which remains verifiable but is rejected by the
-public gate. The export sequence is a monitor assertion, not a cryptographic
-directory checkpoint. There is no command to skip to an arbitrary late cursor.
+public gate. Legacy export sequence fields are not emitted by per-DID coverage.
 
-### Migrations 3-4 and rollback
+### Migrations 3-5 and rollback
 
 Stop the old monitor/attestation processes before upgrading; deploy one consistent
-runtime before using v2 evidence. Mixed-version production attestation is not a
+runtime before using v3 evidence. Mixed-version production attestation is not a
 supported rollout. `monitor:migrate` preserves all existing cursors, enrollment,
 observation, alert and approval rows and starts `caught_up=false`. It creates no
 reviewed bootstrap records for old enrollments. Repeated migration is checksum
@@ -136,24 +132,21 @@ migration exists and no reviewed checkpoint would be lost. It refuses incomplete
 backfill and any sole reviewed-bootstrap record. Re-upgrade preserves legacy
 rows but requires new catch-up; rollback is not production-readiness proof.
 Preserve old enrollment history when planning any new reviewed ceremony rather
-than deleting it to manufacture a v2 label.
+than deleting it to manufacture a v3 label.
 
 Migration 4 expands the closed alert category set for the delivered onboarding
 enrollment notification. Its guarded rollback refuses while any such notification
 evidence exists or a later monitor migration is installed.
 
+Migration 5 adds retained per-DID audits and poll timestamps without deleting the
+legacy cursor. New observations no longer need a global sequence. Its rollback
+refuses after any per-DID evidence has been recorded.
+
 ## Production Work Still Required
 
-`/export?after=<seq>` is a global PLC sequence. This prototype starts at
-sequence zero and requires contiguous results. A large public directory
-requires a **verified bootstrap checkpoint** or complete backfill before it
-can assert coverage; an arbitrary late cursor is not proof of monitoring.
-The reference now implements reviewed per-DID checkpoints plus complete-backfill
-readiness. Fast bootstrap from an independently verified late global checkpoint
-remains unimplemented. External health supervision is also needed to alert while
-the monitor process itself is offline. The POC has not selected independently
-operated PLC mirrors or deployed this
-project on a separate user-owned host. The same-VPS private-directory
+External health supervision is needed to alert while
+the monitor process itself is offline. The project has not been deployed on a
+separate user-owned host. The same-VPS private-directory
 deployment has proven signed HTTPS webhook delivery and durable restart
 behavior with a disposable DID; it does not prove host independence.
 Review and operation approval are local commands rather than a

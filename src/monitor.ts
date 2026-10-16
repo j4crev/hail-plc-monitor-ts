@@ -2,14 +2,13 @@ import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { isDeepStrictEqual } from "node:util";
 import { cidForCbor } from "@atproto/common";
-import { def, validateOperationLog, type DocumentData } from "@did-plc/lib";
+import { assureValidNextOp, def, validateOperationLog, type DocumentData, type ExportedOp, type IndexedOperation } from "@did-plc/lib";
 import type { SQL } from "bun";
 import { plcStateDigest, type MonitorPlcClient } from "./plc.js";
 import type { MonitorSigner } from "./signing.js";
 
 export interface MonitorPollResult {
-  state: "current" | "backfilling" | "unavailable" | "gap" | "invalid-log";
-  lastSeq: number;
+  state: "current" | "unavailable" | "invalid-log";
   inspected: number;
   alerts: number;
 }
@@ -32,89 +31,67 @@ export class PlcMonitor {
     await this.sql.begin(async (tx) => {
       await tx`SELECT singleton FROM monitor_cursor WHERE singleton = true FOR UPDATE`;
       await tx`INSERT INTO monitored_dids (did, expected_cid, expected_state, alert_webhook_url,
-        enrolled_at, last_verified_cid, last_verified_at)
+        enrolled_at, last_verified_cid, last_verified_at, last_audit, coverage_since)
         VALUES (${did}, ${expectedCid}, ${JSON.stringify(current.state)}::jsonb,
-          ${alertWebhookUrl}, ${enrolledAt}, ${expectedCid}, ${enrolledAt})`;
+          ${alertWebhookUrl}, ${enrolledAt}, ${expectedCid}, ${enrolledAt},
+          ${JSON.stringify(current.audit)}::jsonb, ${enrolledAt})`;
       if (reviewed !== undefined) {
         await tx`INSERT INTO monitor_bootstrap_checkpoints (did, operation_cid, reviewed_state, reviewed_at)
           VALUES (${did}, ${expectedCid}, ${JSON.stringify(current.state)}::jsonb, ${enrolledAt})`;
         await this.alert(tx, did, "onboarding-enrollment", `onboarding:${did}:${expectedCid}`,
           { operationCid: expectedCid, enrolledAt: enrolledAt.toISOString() });
-        await tx`UPDATE monitor_cursor SET caught_up=false,last_healthy_at=NULL,updated_at=${enrolledAt} WHERE singleton=true`;
       }
     });
   }
 
-  async poll(count = 100): Promise<MonitorPollResult> {
-    if (!Number.isSafeInteger(count) || count < 1 || count > 100) throw new Error("Monitor poll count must be 1–100");
+  async poll(_legacyCount?:number): Promise<MonitorPollResult> {
     return this.sql.begin(async (tx): Promise<MonitorPollResult> => {
-      const cursor = await tx<{ last_seq: number | string | bigint; last_healthy_at: Date | null }[]>`
-        SELECT last_seq, last_healthy_at FROM monitor_cursor WHERE singleton = true FOR UPDATE`;
-      const before = Number(cursor[0]?.last_seq);
-      if (!Number.isSafeInteger(before)) throw new Error("Monitor cursor is unsafe");
       const now = this.now();
-      // Retain the last healthy time for downtime detection, but do not let a
-      // failed/new partial batch preserve the previous readiness assertion.
-      await tx`UPDATE monitor_cursor SET caught_up = false, updated_at = ${now} WHERE singleton = true`;
       let alerts = 0;
-      const monitored = await tx<{ did: string; enrolled_at: Date }[]>`SELECT did, enrolled_at FROM monitored_dids ORDER BY did`;
+      let result:MonitorPollResult["state"]="current",inspected=0;
+      const monitored = await tx<{ did:string;expected_cid:string;expected_state:unknown;enrolled_at:Date;
+        last_polled_at:Date|null;last_audit:unknown }[]>`SELECT did,expected_cid,expected_state,enrolled_at,last_polled_at,last_audit
+        FROM monitored_dids ORDER BY did FOR UPDATE`;
       for (const row of monitored) {
-        const lastHealthy = cursor[0]?.last_healthy_at;
-        const baseline = lastHealthy && lastHealthy > row.enrolled_at ? lastHealthy : row.enrolled_at;
+        const baseline = row.last_polled_at && row.last_polled_at > row.enrolled_at ? row.last_polled_at : row.enrolled_at;
         if (now.getTime() - baseline.getTime() > 86_400_000) alerts += await this.alert(tx, row.did, "coverage-lost",
           `coverage:${row.did}:${baseline.toISOString()}`,
-          { lastHealthyAt: lastHealthy?.toISOString() ?? null, enrolledAt: row.enrolled_at.toISOString(), observedAt: now.toISOString() });
-      }
-      let exported;
-      try {
-        exported = await this.plc.exportAfter(before, count);
-        if (exported.length > count) throw new Error("PLC export exceeds requested page size");
-      }
-      catch { return { state: "unavailable", lastSeq: before, inspected: 0, alerts }; }
-      let next = before;
-      let inspected = 0;
-      for (const entry of exported) {
-        if (!Number.isSafeInteger(entry.seq) || entry.seq !== next + 1) {
-          for (const row of monitored) alerts += await this.alert(tx, row.did, "export-gap",
-            `gap:${row.did}:${next}:${entry.seq}`,
-            { expectedSeq: next + 1, receivedSeq: entry.seq });
-          return { state: "gap", lastSeq: before, inspected, alerts };
-        }
-        const watched = await tx<{ expected_cid: string; expected_state: unknown }[]>`
-          SELECT expected_cid, expected_state FROM monitored_dids WHERE did = ${entry.did}`;
-        if (watched[0]) {
-          try {
-            if ((await cidForCbor(entry.operation)).toString() !== entry.cid) {
-              throw new Error("Sequenced operation CID does not match its bytes");
-            }
-            const current = await this.readState(entry.did);
-            const approvedState = typeof watched[0].expected_state === "string"
-              ? JSON.parse(watched[0].expected_state) as DocumentData : watched[0].expected_state;
-            const expected = current.cid === watched[0].expected_cid && isDeepStrictEqual(current.state, approvedState);
-            await tx`INSERT INTO monitor_observations (did, cid, seq, operation, expected)
-              VALUES (${entry.did}, ${entry.cid}, ${entry.seq}, ${JSON.stringify(entry.operation)}::jsonb,
-                ${expected}) ON CONFLICT (did, cid) DO NOTHING`;
-            if (!expected) {
-              alerts += await this.alert(tx, entry.did, "unexpected-operation", `operation:${entry.did}:${entry.cid}`,
-                { operationCid: entry.cid, currentCid: current.cid, expectedCid: watched[0].expected_cid });
-            } else {
-              await tx`UPDATE monitored_dids SET last_verified_cid = ${current.cid}, last_verified_at = ${now}
-                WHERE did = ${entry.did}`;
-            }
-          } catch {
-            alerts += await this.alert(tx, entry.did, "invalid-operation-log", `invalid:${entry.did}:${entry.cid}`,
-              { operationCid: entry.cid });
-            return { state: "invalid-log", lastSeq: before, inspected, alerts };
+          { lastHealthyAt: row.last_polled_at?.toISOString() ?? null, enrolledAt: row.enrolled_at.toISOString(), observedAt: now.toISOString() });
+        let rawAudit:ExportedOp[];
+        try { rawAudit=await this.plc.getAuditableLog(row.did); }
+        catch { result=result==="invalid-log"?result:"unavailable";await tx`UPDATE monitored_dids SET poll_ready=false WHERE did=${row.did}`;continue; }
+        try {
+          const current=await this.readState(row.did,rawAudit);
+          const previous=typeof row.last_audit==="string"?JSON.parse(row.last_audit) as ExportedOp[]:row.last_audit as ExportedOp[]|null;
+          if(previous)this.assertNoHistoryRegression(previous,current.audit);
+          const known=new Set((previous??[]).map(entry=>entry.cid));
+          const approvedState=typeof row.expected_state==="string"?JSON.parse(row.expected_state) as DocumentData:row.expected_state;
+          const expected=current.cid===row.expected_cid&&isDeepStrictEqual(current.state,approvedState);
+          for(const entry of current.audit)if(!known.has(entry.cid)){
+            await tx`INSERT INTO monitor_observations (did,cid,seq,operation,expected)
+              VALUES (${row.did},${entry.cid},NULL,${JSON.stringify(entry.operation)}::jsonb,${expected})
+              ON CONFLICT (did,cid) DO NOTHING`;
+            if(entry.cid!==row.expected_cid)alerts+=await this.alert(tx,row.did,"unexpected-operation",`operation:${row.did}:${entry.cid}`,
+              {operationCid:entry.cid,expectedCid:row.expected_cid});
+            inspected+=1;
           }
-          inspected += 1;
+          if(!expected)alerts+=await this.alert(tx,row.did,"unexpected-operation",`operation:${row.did}:${current.cid}`,
+            {operationCid:current.cid,expectedCid:row.expected_cid});
+          await tx`UPDATE monitored_dids SET last_audit=${JSON.stringify(current.audit)}::jsonb,last_polled_at=${now},
+            coverage_since=COALESCE(coverage_since,${now}),poll_ready=true,
+            last_verified_cid=CASE WHEN ${expected} THEN ${current.cid} ELSE last_verified_cid END,
+            last_verified_at=CASE WHEN ${expected} THEN ${now} ELSE last_verified_at END WHERE did=${row.did}`;
+        } catch {
+          result="invalid-log";
+          await tx`UPDATE monitored_dids SET poll_ready=false WHERE did=${row.did}`;
+          alerts+=await this.alert(tx,row.did,"invalid-operation-log",`invalid:${row.did}`,
+            {observedAt:now.toISOString()});
         }
-        next = entry.seq;
       }
-      const caughtUp = exported.length < count;
-      await tx`UPDATE monitor_cursor SET last_seq = ${next}, caught_up = ${caughtUp},
-        last_healthy_at = CASE WHEN ${caughtUp} THEN ${now} ELSE last_healthy_at END, updated_at = ${now}
-        WHERE singleton = true`;
-      return { state: caughtUp ? "current" : "backfilling", lastSeq: next, inspected, alerts };
+      await tx`UPDATE monitor_cursor SET caught_up=${result==="current"},
+        last_healthy_at=CASE WHEN ${result==="current"} THEN ${now} ELSE last_healthy_at END,updated_at=${now}
+        WHERE singleton=true`;
+      return {state:result,inspected,alerts};
     });
   }
 
@@ -150,15 +127,12 @@ export class PlcMonitor {
     const current = await this.readState(did);
     if (current.cid !== operationCid) throw new Error("Monitor cannot attest a noncurrent PLC operation");
     return this.sql.begin(async tx => {
-    // Same cursor-first lock order as poll: an in-flight failing poll cannot
-    // race an attestation based on its previously committed readiness.
-    await tx`SELECT singleton FROM monitor_cursor WHERE singleton = true FOR SHARE`;
     const rows = await tx<{ expected_cid: string; expected_state: unknown; enrolled_at: Date;
-      last_healthy_at: Date | null; caught_up: boolean; last_seq: string | bigint | number;
-      bootstrap_cid: string | null; bootstrap_state: unknown;
+      coverage_since:Date|null;last_polled_at:Date|null;poll_ready:boolean;
+      last_audit:unknown;bootstrap_cid: string | null; bootstrap_state: unknown;
       approved: number; notified: number; gaps: number }[]>`
       SELECT watched.expected_cid, watched.expected_state, watched.enrolled_at,
-        cursor.last_healthy_at, cursor.caught_up, cursor.last_seq,
+        watched.coverage_since,watched.last_polled_at,watched.poll_ready,watched.last_audit,
         bootstrap.operation_cid AS bootstrap_cid, bootstrap.reviewed_state AS bootstrap_state,
         (SELECT count(*)::int FROM monitor_approvals approved WHERE approved.did = ${did}
           AND approved.operation_cid = ${operationCid}) AS approved,
@@ -166,30 +140,32 @@ export class PlcMonitor {
           AND alert.correlation = ${`operation:${did}:${operationCid}`} AND alert.sent_at IS NOT NULL) AS notified,
         (SELECT count(*)::int FROM monitor_alerts alert WHERE alert.did = ${did}
           AND alert.category IN ('coverage-lost', 'export-gap', 'invalid-operation-log')) AS gaps
-      FROM monitored_dids watched CROSS JOIN monitor_cursor cursor
+      FROM monitored_dids watched
       LEFT JOIN monitor_bootstrap_checkpoints bootstrap ON bootstrap.did = watched.did
-      WHERE watched.did = ${did} AND cursor.singleton = true FOR SHARE OF watched
+      WHERE watched.did = ${did} FOR SHARE OF watched
     `;
     const watched = rows[0];
     const expectation = typeof watched?.expected_state === "string"
       ? JSON.parse(watched.expected_state) as DocumentData : watched?.expected_state;
+    const retained=typeof watched?.last_audit==="string"?JSON.parse(watched.last_audit) as ExportedOp[]:watched?.last_audit as ExportedOp[]|null;
     const now = this.now();
     if (!watched || watched.expected_cid !== operationCid ||
-      !isDeepStrictEqual(current.state, expectation) ||
+      !isDeepStrictEqual(current.state, expectation) || !watched.coverage_since || !watched.poll_ready ||
       watched.approved !== 1 || watched.notified < 1 || watched.gaps !== 0 ||
-      !watched.caught_up || !watched.last_healthy_at || now.getTime() - watched.last_healthy_at.getTime() > 300_000 ||
-      watched.last_healthy_at.getTime() > now.getTime() + 300_000 || watched.enrolled_at.getTime() > now.getTime() + 300_000) {
+      !watched.last_polled_at || now.getTime() - watched.last_polled_at.getTime() > 300_000 ||
+      watched.last_polled_at.getTime() > now.getTime() + 300_000 || watched.enrolled_at.getTime() > now.getTime() + 300_000) {
       throw new Error("Independent monitor approval or uninterrupted coverage is unavailable");
     }
-    const sequence = Number(watched.last_seq);
-    if (!Number.isSafeInteger(sequence) || sequence < 1) throw new Error("Monitor export checkpoint is unsafe");
+    if(!retained)throw new Error("Independent monitor has no retained DID audit");
+    this.assertNoHistoryRegression(retained,current.audit);
+    if(!isDeepStrictEqual(retained,current.audit))throw new Error("Independent monitor has not polled the current DID audit");
     const bootstrap = typeof watched.bootstrap_state === "string"
       ? JSON.parse(watched.bootstrap_state) as DocumentData : watched.bootstrap_state as DocumentData;
-    return signer.signCoverage({ type: "hail.plc-monitor-attestation", version: watched.bootstrap_cid ? 2 : 1,
+    return signer.signCoverage({ type: "hail.plc-monitor-attestation", version: watched.bootstrap_cid ? 3 : 1,
       did, transfer_id: transferId, operation_cid: operationCid, monitor_origin: origin,
-      coverage_since: Math.floor(watched.enrolled_at.getTime() / 1000),
+      coverage_since: Math.floor(watched.coverage_since.getTime() / 1000),
       observed_at: Math.floor(now.getTime() / 1000),
-      ...(watched.bootstrap_cid ? { bootstrap_cid: watched.bootstrap_cid, bootstrap_state_digest: plcStateDigest(bootstrap), export_sequence: sequence } : {}) });
+      ...(watched.bootstrap_cid ? { bootstrap_cid: watched.bootstrap_cid, bootstrap_state_digest: plcStateDigest(bootstrap) } : {}) });
     });
   }
 
@@ -200,61 +176,67 @@ export class PlcMonitor {
     const current = await this.readState(did);
     if (current.cid !== operationCid) throw new Error("Monitor cannot attest a noncurrent onboarding operation");
     return this.sql.begin(async tx => {
-      await tx`SELECT singleton FROM monitor_cursor WHERE singleton = true FOR SHARE`;
       const watched = (await tx<{ expected_cid: string; expected_state: unknown; enrolled_at: Date;
-        last_healthy_at: Date | null; caught_up: boolean; last_seq: string | bigint | number;
-        bootstrap_cid: string | null; bootstrap_state: unknown; gaps: number; notified: number }[]>`
+        coverage_since:Date|null;last_polled_at:Date|null;poll_ready:boolean;
+        last_audit:unknown;bootstrap_cid: string | null; bootstrap_state: unknown; gaps: number; notified: number }[]>`
         SELECT watched.expected_cid, watched.expected_state, watched.enrolled_at,
-          cursor.last_healthy_at, cursor.caught_up, cursor.last_seq,
+          watched.coverage_since,watched.last_polled_at,watched.poll_ready,watched.last_audit,
           bootstrap.operation_cid AS bootstrap_cid, bootstrap.reviewed_state AS bootstrap_state,
           (SELECT count(*)::int FROM monitor_alerts alert WHERE alert.did = ${did}
             AND alert.category = 'onboarding-enrollment' AND alert.sent_at IS NOT NULL) AS notified,
           (SELECT count(*)::int FROM monitor_alerts alert WHERE alert.did = ${did}
             AND alert.category IN ('coverage-lost', 'export-gap', 'invalid-operation-log')) AS gaps
-        FROM monitored_dids watched CROSS JOIN monitor_cursor cursor
+        FROM monitored_dids watched
         LEFT JOIN monitor_bootstrap_checkpoints bootstrap ON bootstrap.did = watched.did
-        WHERE watched.did = ${did} AND cursor.singleton = true FOR SHARE OF watched
+        WHERE watched.did = ${did} FOR SHARE OF watched
       `)[0];
       const expected = typeof watched?.expected_state === "string" ? JSON.parse(watched.expected_state) : watched?.expected_state;
       const bootstrap = typeof watched?.bootstrap_state === "string" ? JSON.parse(watched.bootstrap_state) : watched?.bootstrap_state;
-      const now = this.now(), sequence = Number(watched?.last_seq);
+      const retained=typeof watched?.last_audit==="string"?JSON.parse(watched.last_audit) as ExportedOp[]:watched?.last_audit as ExportedOp[]|null;
+      const now = this.now();
       if (!watched || watched.expected_cid !== operationCid || watched.bootstrap_cid !== operationCid ||
         !isDeepStrictEqual(current.state, expected) || !isDeepStrictEqual(current.state, bootstrap) ||
-        watched.gaps !== 0 || watched.notified !== 1 || !watched.caught_up || !watched.last_healthy_at ||
-        watched.last_healthy_at.getTime() < watched.enrolled_at.getTime() ||
-        now.getTime() - watched.last_healthy_at.getTime() > 300_000 ||
-        watched.last_healthy_at.getTime() > now.getTime() + 300_000 || !Number.isSafeInteger(sequence) || sequence < 1) {
+        watched.gaps !== 0 || watched.notified !== 1 || !watched.coverage_since || !watched.poll_ready || !watched.last_polled_at ||
+        watched.last_polled_at.getTime() < watched.enrolled_at.getTime() ||
+        now.getTime() - watched.last_polled_at.getTime() > 300_000 ||
+        watched.last_polled_at.getTime() > now.getTime() + 300_000) {
         throw new Error("Independent onboarding monitor coverage is unavailable");
       }
-      return signer.signOnboardingCoverage({ type: "hail.plc-onboarding-monitor-attestation", version: 1,
+      if(!retained)throw new Error("Independent onboarding monitor has no retained DID audit");
+      this.assertNoHistoryRegression(retained,current.audit);
+      if(!isDeepStrictEqual(retained,current.audit))throw new Error("Independent onboarding monitor has not polled the current DID audit");
+      return signer.signOnboardingCoverage({ type: "hail.plc-onboarding-monitor-attestation", version: 2,
         did, operation_cid: operationCid, monitor_origin: origin,
-        coverage_since: Math.floor(watched.enrolled_at.getTime() / 1000),
+        coverage_since: Math.floor(watched.coverage_since.getTime() / 1000),
         observed_at: Math.floor(now.getTime() / 1000), bootstrap_state_digest: plcStateDigest(current.state),
-        export_sequence: sequence });
+      });
     });
   }
 
-  private async readState(did: string): Promise<{ cid: string; state: DocumentData }> {
-    const [log, data, audit] = await Promise.all([
-      this.plc.getOperationLog(did), this.plc.getDocumentData(did), this.plc.getAuditableLog(did),
-    ]);
-    const state = await validateOperationLog(did, log);
-    const last = log[log.length - 1];
-    if (!state || !last || !isDeepStrictEqual(state, data)) throw new Error("PLC log and complete current state disagree");
-    const cid = (await cidForCbor(last)).toString();
-    const current = audit[audit.length - 1];
-    if (!current || current.did !== did || current.cid !== cid || current.nullified ||
-      !isDeepStrictEqual(current.operation, last) ||
-      !isDeepStrictEqual(audit.filter(entry => !entry.nullified).map(entry => entry.operation), log)) {
-      throw new Error("PLC audit does not confirm the current non-nullified operation");
+  private async readState(did:string,source?:readonly unknown[]):Promise<{cid:string;state:DocumentData;audit:ExportedOp[]}>{
+    const audit=(source??await this.plc.getAuditableLog(did)).map(entry=>def.exportedOp.parse(entry));
+    if(!audit.length||audit.length>1000)throw new Error("PLC audit is incomplete or exceeds the monitor limit");
+    const history:IndexedOperation[]=[],seen=new Set<string>();let previousTime=-Infinity;
+    for(const entry of audit){
+      const cid=await cidForCbor(entry.operation),createdAt=new Date(entry.createdAt);
+      if(entry.did!==did||cid.toString()!==entry.cid||seen.has(entry.cid)||!Number.isFinite(createdAt.getTime())||createdAt.getTime()<previousTime)
+        throw new Error("PLC audit bytes or annotations are invalid");
+      const accepted=await assureValidNextOp(did,history.filter(operation=>!operation.nullified),entry.operation,createdAt);
+      for(const nullified of accepted.nullified){const prior=history.find(operation=>operation.cid.equals(nullified));if(!prior)throw new Error("PLC audit recovery is incomplete");prior.nullified=true;}
+      history.push({did,cid,operation:entry.operation,createdAt,nullified:false});seen.add(entry.cid);previousTime=createdAt.getTime();
     }
-    const seen = new Set<string>();
-    for (const entry of audit) {
-      if (entry.did !== did || seen.has(entry.cid) || !Number.isFinite(Date.parse(entry.createdAt)) ||
-        (await cidForCbor(entry.operation)).toString() !== entry.cid) throw new Error("PLC audit bytes or annotations disagree with the log");
-      seen.add(entry.cid);
+    if(history.some((entry,index)=>entry.nullified!==audit[index]!.nullified))throw new Error("PLC audit nullification is invalid");
+    const log=history.filter(entry=>!entry.nullified).map(entry=>entry.operation),state=await validateOperationLog(did,log),last=history.filter(entry=>!entry.nullified).at(-1);
+    if(!state||!last)throw new Error("PLC audit has no valid current state");
+    return {cid:last.cid.toString(),state,audit};
+  }
+
+  private assertNoHistoryRegression(previous:readonly ExportedOp[],current:readonly ExportedOp[]):void{
+    const byCid=new Map(current.map(entry=>[entry.cid,entry]));
+    for(const prior of previous){const next=byCid.get(prior.cid);
+      if(!next||prior.did!==next.did||prior.createdAt!==next.createdAt||!isDeepStrictEqual(prior.operation,next.operation)||prior.nullified&&!next.nullified)
+        throw new Error("PLC audit history regressed");
     }
-    return { cid, state };
   }
 
   private async alert(tx: SQL, did: string | null, category: string, correlation: string,
