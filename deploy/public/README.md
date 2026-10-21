@@ -1,10 +1,12 @@
-# Provider-bootstrap public monitor
+# Public alpha monitor
 
 This profile runs the monitor worker and its private PostgreSQL database. It polls
 each enrolled DID's canonical `https://plc.directory/<did>/log/audit` endpoint.
 
-Hosting this stack beside a Hail provider or its replica is useful for pre-alpha
-testing but is not independent monitoring.
+The alpha deployment runs this stack on a separate VPS from both providers and
+uses an external signed-alert email receiver. A deployment beside a provider or
+within the same failure domain remains bootstrap evidence, not independent
+production monitoring.
 
 ## Prepare, but do not start yet
 

@@ -1,22 +1,25 @@
 # Independent Hail PLC Monitor
 
-Prototype of a user-run monitor for the Hail portable-custody profile. The
-monitor validates and retains complete per-DID audit logs,
+Reference monitor for the Hail portable-custody profile. The deployed public
+alpha runs on a separate VPS with PostgreSQL, validates and retains complete
+per-DID `plc.directory` audit logs,
 records unexpected operations and lost coverage, and signs bounded coverage
 attestations for a provider migration. Migration 3 adds reviewed bootstrap
 checkpoint retention and durable polling readiness; see the candidate
 [PLC read-evidence policy](https://github.com/j4crev/hailproto/blob/main/spec/plc-read-evidence.md).
-Hosting it on infrastructure controlled
-by a Hail provider is a **bootstrap convenience**, not independent coverage
-under `../hailproto/spec/account-onboarding.md`.
+It currently monitors the `hailproto.app` and `hailproto.dev` canaries every four
+minutes. Signed alerts go to a Cloudflare Worker that pins the monitor key and
+sends external email; the Worker returned `204` and delivered live enrollment
+alerts. Hosting the monitor on infrastructure controlled by a Hail provider is
+still a **bootstrap convenience**, not independent coverage under
+`../hailproto/spec/account-onboarding.md`.
 
-The prepared same-host public bootstrap profile is documented in
+The deployed public profile is documented in
 [`deploy/public`](deploy/public/README.md).
 
 This project is intentionally a sibling of `hailproto`, `hail-server-ts`, and
-the pinned official `did-method-plc` checkout. It cannot monitor the live POC
-DIDs via the public PLC registry because those DIDs exist only in its private
-directory. The private-directory URL is used in isolated tests and the
+the pinned official `did-method-plc` checkout. Historical POC DIDs remain only
+in their private directory; the private URL is used in isolated tests and the
 explicitly non-independent [same-VPS POC deployment](deploy/poc/README.md).
 
 ## Implemented Boundary
@@ -144,11 +147,10 @@ refuses after any per-DID evidence has been recorded.
 
 ## Production Work Still Required
 
-External health supervision is needed to alert while
-the monitor process itself is offline. The project has not been deployed on a
-separate user-owned host. The same-VPS private-directory
-deployment has proven signed HTTPS webhook delivery and durable restart
-behavior with a disposable DID; it does not prove host independence.
+External dead-man supervision is still needed to alert while the monitor process
+itself is offline. The public alpha is deployed on a separate VPS and its email
+receiver is external, but same-hosting-provider failure and restore exercises
+remain open; this is not complete production independence.
 Review and operation approval are local commands rather than a
 cross-device user interface. A service hosted by the Hail provider may help
 users bootstrap but cannot satisfy the portable-custody rule that the monitor
