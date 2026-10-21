@@ -1,5 +1,8 @@
 # Independent Hail PLC Monitor
 
+> [!IMPORTANT]
+> Development has moved to [`hailproto/apps/plc-monitor`](https://github.com/j4crev/hailproto/tree/main/apps/plc-monitor). This repository is retained only for historical issues, releases, and links.
+
 Reference monitor for the Hail portable-custody profile. The deployed public
 alpha runs on a separate VPS with PostgreSQL, validates and retains complete
 per-DID `plc.directory` audit logs,
