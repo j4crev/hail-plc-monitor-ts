@@ -54,7 +54,7 @@ export default {
       return new Response(null,{status:400});
     await env.ALERT_EMAIL.send({to:env.ALERT_RECIPIENT,from:env.ALERT_SENDER,
       subject:`[Hail PLC] ${alert.category}: ${alert.did}`,
-      text:`A signed Hail PLC monitor alert was received.\n\n${JSON.stringify(alert,null,2)}\n\nMonitor key: ${key}`});
+      text:`A signed Hail PLC monitor alert was received.\n\n${JSON.stringify(alert,null,2)}`});
     return new Response(null,{status:204});
   },
 };
